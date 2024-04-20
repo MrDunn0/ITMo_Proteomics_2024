@@ -1,0 +1,358 @@
+---
+title: 'Proteomics assignment'
+author: "Mikhail Ushakov"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache = TRUE)
+```
+
+```{r libraries, include=FALSE, message=FALSE, warning=FALSE}
+library(readxl)
+library(limma)
+library(ape)
+library(dendextend)
+library(RColorBrewer)
+library(pvclust)
+library(gplots)
+library(NMF)
+library(vegan)
+library(Biobase)
+library(DT)
+library(ggplot2)
+library(impute)
+library(ggrepel)
+library(gprofiler2)
+library(dplyr)
+```
+
+# Load data
+
+```{r message=FALSE, warning=FALSE}
+
+data <- read.csv('peaks_data.csv')
+
+```
+
+# EDA & Preprocessing
+
+## Filtration
+
+Remove genes with half and more missing values
+
+```{r message=FALSE, warning=FALSE}
+rows_with_NA <- which(rowSums(is.na(data)) > ncol(data)/2)
+data_filt <- data[!rownames(data) %in% rows_with_NA, ]
+```
+
+Filter duplicated genes
+
+```{r message=FALSE, warning=FALSE}
+duplicated_genes <- data_filt %>% group_by(Gene_id) %>%  count() %>% filter(n > 1) %>% pull(Gene_id)
+data_filt <- data_filt %>% filter(!Gene_id %in% duplicated_genes)
+rownames(data_filt) <- data_filt$Gene_id
+```
+
+## NA values imputation
+
+
+```{r message=FALSE, warning=FALSE}
+data_t <- data_filt %>% dplyr::select(where(is.numeric)) %>% t() %>%  as.matrix()
+data_knn <- impute.knn(data_t, k = 5)
+data_knn <- data_knn$data
+data_knn <- as.data.frame(data_knn)
+#knn_yeast$LEU2 <- knn_yeast$LEU2 / 2
+#knn_yeast$URA3 <- knn_yeast$URA3 / 2
+data_knn <- t(as.matrix(data_knn))
+```
+
+
+```{r message=FALSE, warning=FALSE}
+experiment <- as.factor(gsub('_[0-9]+', '', colnames(data_knn)))
+```
+
+
+```{r message=FALSE, warning=FALSE}
+pal <- brewer.pal(n = 9, name = "Set1")
+cols <- pal[experiment]
+boxplot(data_knn, outline = FALSE, main = "Initial data", col = cols)
+legend("topright", levels(experiment), fill = pal, bty = "n", xpd = T)
+```
+
+## Normalization
+
+Perform log- and quantile normalization
+
+```{r message=FALSE, warning=FALSE}
+data_log <- log2(data_knn + 1)
+data_norm <- normalizeQuantiles(as.matrix(data_log))
+boxplot(data_norm, outline = FALSE, main = "Normalizaed data", col = cols)
+legend("topright", levels(experiment), fill = pal, bty = "n", xpd = T)
+```
+
+
+```{r message=FALSE, warning=FALSE}
+data_pca <- t(data_norm)
+terapod_pca <- rda(data_pca, scale = TRUE)
+
+rownames(data_pca) <- experiment
+
+df_scores <- data.frame(data_pca,
+                        scores(terapod_pca, display = "sites", choices = c(1, 2, 3), scaling = "sites"))
+
+p_scores <- ggplot(df_scores, aes(x = PC1, y = PC2)) + 
+  geom_point(aes(color = rownames(data_pca)), alpha = 0.5) +
+  coord_equal(xlim = c(-3, 3), ylim = c(-3, 3)) + ggtitle(label = "PCA") + theme_bw()
+p_scores
+```
+
+Groups are well discriminated by PC1
+
+## MA-plot
+
+```{r message=FALSE, warning=FALSE}
+maplot <- function(X1, X2, pch = 21, main = "MA-plot", xlab = "Average log-expression", ylab = "Expression log-ratio", lpars = list(col = "blue", lwd = 2), ...){
+  # Координаты
+  X <- (rowMeans(X2) + rowMeans(X1)) / 2
+  Y <- rowMeans(X2) - rowMeans(X1)
+  # График
+  scatter.smooth(x = X, y = Y, main = main, pch = pch, xlab = xlab, ylab = ylab, lpars = lpars, ...)
+  abline(h = c(-1, 0, 1), lty = c(2, 1, 2))
+}
+
+```
+
+```{r message=FALSE, warning=FALSE}
+maplot(data_norm[, 1:14], data_norm[, 15:33])
+```
+
+# DE
+
+## Prepare dataset
+
+```{r message=FALSE, warning=FALSE}
+expr_data <- as.matrix(data_norm)
+
+# Sample data
+pheno_data <- data.frame(experiment)
+rownames(pheno_data) <- colnames(data_norm)
+pheno_metadata <- data.frame(
+  labelDescription = c("Experimental condition"),
+  row.names=c("Condition"))
+pheno_data <- new("AnnotatedDataFrame",
+                 data = pheno_data,
+                 varMetadata = pheno_metadata)
+
+# Traits data
+feature_data <- data.frame(Prot = rownames(expr_data))
+rownames(feature_data) <- rownames(expr_data)
+feature_metadata <- data.frame(
+  labelDescription = c("Protain name"),
+  row.names = c("Protain"))
+f_data <- new("AnnotatedDataFrame",
+              data = feature_data,
+              varMetadata = feature_metadata)
+
+# Combine
+exp_set <-
+  ExpressionSet(assayData = expr_data,
+                phenoData = pheno_data,
+                featureData = f_data)
+```
+
+## limma
+
+```{r message=FALSE, warning=FALSE}
+X <- model.matrix(~ experiment, pData(exp_set))
+fit <- lmFit(exp_set, design = X, method = "robust", maxit = 1000)
+efit <- eBayes(fit)
+```
+
+```{r message=FALSE, warning=FALSE}
+MA_limma <- function(efit, coef, n = 10, signif = TRUE, fdr = 0.05, lfc = 0, text = TRUE, cex.text = 0.8, col.text = "grey20", main = "MA-plot", xlab = "Average log-expression", ylab = "Expression log-ratio", pch = 19, pch.signif = 21, col = "darkgreen", alpha = 0.3, cex = 0.3, ...){
+  # соотношение и интенсивность
+  R <- efit$coefficients[, coef]
+  I <- efit$Amean
+  # прозрачный цвет
+  col_btransp <- adjustcolor(col, alpha.f = alpha)
+  # график
+  plot(I, R, cex = cex, main = main, pch = pch, xlab = xlab, ylab = ylab, col = col_btransp, ...)
+  abline(h = 0)
+  # отмечаем дифференциально-экспрессируемые белки
+  if(signif){
+    sign <- p.adjust(efit$p.value[, coef], method = "BH") <= fdr
+    large <- abs(efit$coefficients[, coef]) >= lfc
+    points(I[sign & large], R[sign & large], cex = cex*2, col = "orange2", pch = pch.signif)
+  }
+  # подписываем первые n белков с сильнее всего различающейся экспрессией
+  if(text){
+    ord <- order(efit$lods[, coef], decreasing = TRUE)
+    top_n <- ord[1:n]
+    text(I[top_n], R[top_n], labels = efit$genes[top_n, ], pos = 4, cex = cex.text, col = col.text)
+  }
+}
+
+
+MA_limma(efit, coef = 2, n = 30)
+```
+
+## DE proteins exploration
+
+### Top proteins
+
+```{r message=FALSE, warning=FALSE}
+
+my_list <- topTable(efit, coef = 2, n = 100)
+dif_exp_set <- exp_set[fData(exp_set)$Prot %in% my_list$Prot, ]
+my_list
+```
+
+
+```{r fig.height=10, fig.width=15, message=FALSE, warning=FALSE}
+dat <- as.matrix(exprs(dif_exp_set))
+# после дополнительной стандартизации по белкам
+pal_blue_red <- colorpanel(75, low = "steelblue", mid = "black", high = "red")
+heatmap.2(dat, col = pal_blue_red, scale = "row", key = TRUE, symkey = FALSE, density.info = "none", trace = "none", cexRow = 0.9, cexCol = 1, margins = c(4, 3), keysize = 0.8, key.par = list(mar = c(3, 0.1, 3, 0.1)))
+```
+
+
+See several clusters overexpressed in one of groups
+
+
+```{r message=FALSE, warning=FALSE}
+topTable(efit, coef = 2)
+numGenes <- nrow(exprs(exp_set))
+full_list <- topTable(efit, number = numGenes)
+full_list <- full_list[full_list$adj.P.Val <= 0.05,]
+nrow(full_list)
+```
+
+### Volcano plot
+
+```{r message=FALSE, warning=FALSE}
+volcano_list <- full_list
+
+volcano1 <- ggplot(data = volcano_list, aes(x = logFC, y = -log10(adj.P.Val))) + geom_point()
+
+volcano2 <- volcano1 + geom_vline(xintercept=c(-0.6, 0.6), col="red") +
+  geom_hline(yintercept=-log10(0.05), col="red")
+
+volcano2
+```
+
+```{r message=FALSE, warning=FALSE}
+volcano_list$diffexpressed[volcano_list$logFC > 1 & volcano_list$adj.P.Val < 0.05] <- "UP"
+```
+
+ if log2Foldchange < -1 and pvalue < 0.05, set as "DOWN" (можно -0.06)
+
+```{r }
+volcano_list$diffexpressed[volcano_list$logFC < -1 & volcano_list$adj.P.Val< 0.05] <- "DOWN"
+
+volcanodif1 <- ggplot(data = volcano_list, aes(x = logFC, y = -log10(adj.P.Val), col = diffexpressed)) + geom_point() + theme_minimal()
+volcanodif1
+```
+
+### Ordination by DE proteins
+
+
+
+```{r fig.height=7, fig.width=15, message=FALSE, warning=FALSE}
+diff_prot <- rownames(full_list)
+diff_expressed <- as.data.frame(data_norm)[diff_prot,]
+t_diff_expressed <- t(diff_expressed)
+#rownames(t_diff_expressed) <-  as.factor(gsub("_[^_]*", replacement = "", rownames(t_diff_expressed)))
+#rownames(t_diff_expressed) <- make.unique(as.character(pheno$yeast_experiment))
+
+d <- dist(x = t_diff_expressed, method = "canberra")
+
+mouse_hc_avg <- hclust(d, method = "average")
+mouse_ph_avg <- as.phylo(mouse_hc_avg)
+mouse_den_avg <- as.dendrogram(mouse_hc_avg)
+
+get_colours <- function(dend, n_chars, palette = "Dark2"){ #nchars = первые нескольок симовлов которые будут использоваться для разделения фактора на группы
+labs <- get_leaves_attr(dend, "label")
+group <- substr(labs, start = 0, stop = n_chars)
+group <- factor(group)
+cols <- brewer.pal(length(levels(group)), name = palette)[group]
+return(cols)
+}
+
+cols <- get_colours(dend = mouse_den_avg, n_chars = 6)
+den_avg_c <- color_labels(dend = mouse_den_avg, col = cols)
+plot(den_avg_c, horiz = TRUE)
+```
+
+# GO enrichment
+
+Filter bad names
+
+```{r}
+library(clusterProfiler)
+library(org.Hs.eg.db)
+```
+
+```{r message=FALSE, warning=FALSE}
+full_list <- full_list %>% filter(!grepl("\n", Prot))
+```
+
+```{r message=FALSE, warning=FALSE}
+up_df <- subset(full_list, logFC > 0)
+# get the significant down-regulated proteins
+down_df <- subset(full_list, logFC < 0)
+```
+
+```{r message=FALSE, warning=FALSE}
+
+up_gene.df <- bitr(
+  up_df$Prot, fromType = "SYMBOL",
+  toType = c("ENSEMBL","ENTREZID"),
+  OrgDb = org.Hs.eg.db)
+```
+
+```{r message=FALSE, warning=FALSE}
+down_gene.df <- bitr(
+  down_df$Prot, fromType = "SYMBOL",
+  toType = c("ENSEMBL","ENTREZID"),
+  OrgDb = org.Hs.eg.db)
+```
+
+```{r message=FALSE, warning=FALSE}
+ego_up <- enrichGO(gene = up_gene.df$ENTREZID[!is.na(up_gene.df$ENTREZID)],
+                     OrgDb = "org.Hs.eg.db",
+                     keyType = "ENTREZID",
+                     ont = "BP",
+                     pAdjustMethod = "BH",
+                     pvalueCutoff = 0.02,
+                     qvalueCutoff = 0.05)
+```
+
+```{r message=FALSE, warning=FALSE}
+ego_down <- enrichGO(gene = down_gene.df$ENTREZID[!is.na(down_gene.df$ENTREZID)],
+                     OrgDb = "org.Hs.eg.db",
+                     keyType = "ENTREZID",
+                     ont = "BP",
+                     pAdjustMethod = "BH",
+                     pvalueCutoff = 0.02,
+                     qvalueCutoff = 0.05)
+```
+
+```{r message=FALSE, warning=FALSE}
+goplot(ego_up)
+dotplot(ego_up)
+```
+
+```{r message=FALSE, warning=FALSE}
+goplot(ego_down)
+dotplot(ego_down)
+```
+
+# Conclusions
+
+Upregulation of processes related to protein localization suggests changes in localization of proteins potentially indicating changes in organelle function or cellular compartmentalization in response to heart valve calcification. Purines are essential for ATP and GTP production and upregulation of purine dependent metabolic processes may reflect increase demand for purine nucleotides, possibly due to  higher cellular activity or some stress response. Also there are some transport and organelle organisation upregulated processes. It may be a sign of ongoing cellular remodeling, repair processes etc. Protein folding processes also indicate some increased cellular activity. The most interesting process here is cellular detoxification, which is probably related to heart valve calcification.
+
+Among the down-regulated processes we can see similar terms related to protein metabolism, organelle dynamics and cellular maintenance. Disruption of actin filament organization  can imacp cellular morphology, mechanical proteprites and contractile function in tissues. Downregularion of macroauthophagy indicates reduced cellular recycling ability. Also it seems there are some problems with translation and overall protein metabolism.
+
+
